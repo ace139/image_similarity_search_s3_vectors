@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+.envrc
+
+# Local environment files
+.env
+
+# Streamlit
+.streamlit/
+
+# OS files
+.DS_Store
+
+# Test data
+data/test_images/
