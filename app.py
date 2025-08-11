@@ -506,6 +506,26 @@ def main():
             key="ingest_uploader",
             help="Upload a single image of your food plate"
         )
+        
+        # Show preview immediately below the uploader (Ingest tab only)
+        if uploaded is not None:
+            # Read bytes once and keep them; also display a preview
+            image_bytes = uploaded.read()
+            st.session_state.current_image_bytes = image_bytes
+            st.session_state.current_image_name = uploaded.name
+            st.session_state.ingest_preview_bytes = image_bytes
+            try:
+                img = Image.open(io.BytesIO(image_bytes))
+                st.image(img, caption=f"Preview: {uploaded.name}", use_container_width=True)
+            except Exception:
+                st.info("Preview unavailable, proceeding with raw bytes.")
+            
+            # Reset generated data ONLY if a different image was uploaded
+            new_hash = _md5_hex(image_bytes)
+            if st.session_state.last_image_hash and st.session_state.last_image_hash != new_hash:
+                st.session_state.generated_description = None
+                st.session_state.generated_embedding = None
+            st.session_state.last_image_hash = new_hash
 
         # Metadata inputs
         st.markdown("**Metadata**")
@@ -535,24 +555,10 @@ def main():
         st.session_state.current_image_name = None
     if 'last_image_hash' not in st.session_state:
         st.session_state.last_image_hash = None
+    if 'ingest_preview_bytes' not in st.session_state:
+        st.session_state.ingest_preview_bytes = None
 
-    if uploaded is not None:
-        # Read bytes once and keep them; also display a preview
-        image_bytes = uploaded.read()
-        st.session_state.current_image_bytes = image_bytes
-        st.session_state.current_image_name = uploaded.name
-        try:
-            img = Image.open(io.BytesIO(image_bytes))
-            st.image(img, caption=f"Preview: {uploaded.name}", use_container_width=True)
-        except Exception:
-            st.info("Preview unavailable, proceeding with raw bytes.")
-
-        # Reset generated data ONLY if a different image was uploaded
-        new_hash = _md5_hex(image_bytes)
-        if st.session_state.last_image_hash and st.session_state.last_image_hash != new_hash:
-            st.session_state.generated_description = None
-            st.session_state.generated_embedding = None
-        st.session_state.last_image_hash = new_hash
+    # Preview handled within ingest tab immediately after uploader
 
     with ingest_tab:
         # Step 1: Generate Description and Embedding
@@ -739,6 +745,12 @@ def main():
                     # Clear session state after successful upload
                     st.session_state.generated_description = None
                     st.session_state.generated_embedding = None
+                    st.session_state.current_image_bytes = None
+                    st.session_state.current_image_name = None
+                    st.session_state.last_image_hash = None
+                    st.session_state.ingest_preview_bytes = None
+                    # Note: Do not attempt to clear the file_uploader via session_state; Streamlit forbids modifying
+                    # a widget's value programmatically after instantiation. We rely on preview-state cleanup instead.
 
                 except (ClientError, BotoCoreError) as aws_err:
                     st.error(f"AWS error: {aws_err}")
@@ -763,6 +775,7 @@ def main():
             )
             if q_up is not None:
                 query_image_bytes = q_up.read()
+                # No preview in Search tab by design
 
         st.markdown("**Filters**")
         user_id_f = st.text_input("User ID (required)", value="", key="search_user_id").strip()
