@@ -15,6 +15,43 @@ A simple Streamlit app to upload images, generate embeddings using Amazon Bedroc
 uv pip install -r requirements.txt
 ```
 
+## Configuration (.env)
+
+Create a `.env` file in the project root with your settings. The app loads all configuration from environment variables (no sidebar inputs):
+
+```dotenv
+# AWS
+AWS_REGION=us-east-1                 # or AWS_DEFAULT_REGION
+# Either provide static credentials (preferred for CI) or use AWS_PROFILE
+# AWS_ACCESS_KEY_ID=...
+# AWS_SECRET_ACCESS_KEY=...
+AWS_PROFILE=default                  # optional, ignored if static credentials are set
+
+# S3 Storage for images and embeddings JSON
+APP_S3_BUCKET=your-bucket
+APP_IMAGES_PREFIX=images/
+APP_EMBEDDINGS_PREFIX=embeddings/
+
+# Bedrock models
+MODEL_ID=amazon.titan-embed-image-v1 # Titan Multimodal Embeddings
+OUTPUT_EMBEDDING_LENGTH=1024         # 256 | 384 | 1024
+
+# Claude Vision via Bedrock Converse requires an inference profile ID/ARN
+CLAUDE_VISION_MODEL_ID=us.anthropic.claude-3-5-sonnet-20241022-v2:0
+
+# S3 Vectors index config (provide EITHER index ARN OR (bucket + name))
+S3V_INDEX_ARN=arn:aws:s3vectors:us-east-1:123456789012:bucket/your-vector-bucket/index/your-index
+# S3V_VECTOR_BUCKET=your-vector-bucket
+# S3V_INDEX_NAME=your-index
+
+# Optional
+APP_DEBUG=false
+```
+
+Notes:
+- For S3 Vectors, `S3V_INDEX_ARN` takes precedence. If not set, both `S3V_VECTOR_BUCKET` and `S3V_INDEX_NAME` are required.
+- `CLAUDE_VISION_MODEL_ID` must be an inference profile ID/ARN (e.g., `us.anthropic.claude-3-5-sonnet-20241022-v2:0`).
+
 ## 🧪 Testing Your AWS Setup
 
 This project includes comprehensive tests to verify your AWS setup before running the main application. It's recommended to run these tests first to ensure everything works correctly.
@@ -29,6 +66,24 @@ This project includes comprehensive tests to verify your AWS setup before runnin
 ```bash
 # Complete workflow test (45 seconds)
 ./tests/run_tests.sh simulation
+```
+
+## Module Structure
+
+```text
+app.py                         # Streamlit UI and workflow orchestration (Ingest/Search)
+mmfood/
+  config.py                    # Centralized environment config loader (AppConfig)
+  aws/
+    session.py                 # boto3 client/session helpers (S3, Bedrock, S3 Vectors)
+    s3.py                      # S3 helpers (presign, uploads, key utils)
+  bedrock/
+    ai.py                      # Titan MM embedding + Claude Vision description
+  s3vectors/
+    utils.py                   # S3 Vectors metadata merge and orphan cleanup
+  utils/
+    time.py                    # to_unix_ts
+    crypto.py                  # md5_hex
 ```
 
 ### Run All Tests
@@ -68,23 +123,18 @@ streamlit run app.py
 The app runs at http://localhost:8501
 
 ## How to use
-1. In the sidebar, set:
-   - AWS Region (e.g., `us-east-1`).
-   - Optional AWS Profile.
-   - S3 Bucket name (must already exist).
-   - Prefixes for images and embeddings (default `images/` and `embeddings/`).
-   - Model ID (default `amazon.titan-embed-image-v1`) and output embedding length (256, 384, 1024).
-   - S3 Vectors settings:
-     - Vector Bucket Name (default `food-plate-vectors`).
-     - Index Name (default `test`).
-     - Index ARN (optional) (default `arn:aws:s3vectors:us-east-1:995133654003:bucket/food-plate-vectors/index/test`).
-2. Optionally click "Test S3 access" to verify permissions.
-3. Upload an image file.
-4. Click "Upload & Embed" to:
-   - Generate an embedding via Amazon Bedrock Titan Multimodal Embeddings.
-   - Upload the original image to S3.
-   - Upload an embeddings JSON record to S3.
-   - Insert the embedding into your Amazon S3 Vectors index via `PutVectors`.
+1. Prepare `.env` as shown above and ensure required IAM permissions.
+2. Launch the app and open the Ingest tab:
+   - Upload a food image
+   - Enter Metadata → User ID (required), meal date/time, meal type
+   - Click "Generate Description & Embedding"
+   - Click "Upload to S3" to store image/JSON and index the embedding in S3 Vectors
+3. Use the Search tab:
+   - Choose query type: Text or Image
+   - Provide search text or upload a query image
+   - Set filters: User ID (required), date range, meal types
+   - Click "Run Search" to query your S3 Vectors index
+4. Optional: set `APP_DEBUG=true` in `.env` to pre-enable extra debug info in image fetching.
 
 ## S3 Object Layout
 - Images: `<images_prefix>/<uuid>.<ext>`
@@ -97,13 +147,13 @@ The app runs at http://localhost:8501
   - `bedrock:InvokeModel`
   - `s3:PutObject`, `s3:HeadBucket`
   - `s3vectors:GetIndex`, `s3vectors:PutVectors` (and later `s3vectors:QueryVectors` for search)
-- Ensure your S3 Vectors bucket and index already exist. Defaults are pre-filled in the sidebar:
-  - Bucket: `food-plate-vectors`
-  - Index: `test`
-  - Index ARN: `arn:aws:s3vectors:us-east-1:995133654003:bucket/food-plate-vectors/index/test`
+- Ensure your S3 Vectors bucket and index already exist. Configure them via your `.env`:
+  - `S3V_VECTOR_BUCKET=your-vector-bucket`
+  - `S3V_INDEX_NAME=your-index`
+  - or set `S3V_INDEX_ARN=arn:aws:s3vectors:REGION:ACCOUNT_ID:bucket/your-vector-bucket/index/your-index`
 
-### Querying (optional)
-The app currently focuses on ingestion. If you want, we can add a simple search UI to generate a query embedding (from image or text) and call `s3vectors.query_vectors` to return the top matches.
+### Querying
+The app includes a Search tab that generates a query embedding (from text or image) and calls `s3vectors.query_vectors` with optional metadata filters.
 
 ### Embeddings JSON schema (example)
 ```json

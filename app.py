@@ -2,16 +2,35 @@ import os
 import io
 import json
 import uuid
-import base64
-import hashlib
 from datetime import datetime, date, time as dtime, timezone, timedelta
-from typing import Optional, Tuple
+from typing import Optional
 
 import streamlit as st
 from PIL import Image
-import boto3
-from botocore.exceptions import ClientError, BotoCoreError, ProfileNotFound
+from botocore.exceptions import ClientError, BotoCoreError
 from dotenv import load_dotenv
+from mmfood.aws.s3 import (
+    presign_url,
+    get_object_bytes_and_meta,
+    upload_bytes_to_s3,
+    ext_from_mime,
+)
+from mmfood.utils.time import to_unix_ts
+from mmfood.utils.crypto import md5_hex
+from mmfood.aws.session import (
+    get_bedrock_client,
+    get_s3_client,
+    get_s3vectors_client,
+)
+from mmfood.bedrock.ai import (
+    generate_mm_embedding,
+    generate_image_description,
+)
+from mmfood.s3vectors.utils import (
+    merge_metadata as _s3v_merge_metadata,
+    delete_orphan_vector_and_artifacts,
+)
+from mmfood.config import load_config, AppConfig
 
 # Helper to read boolean from environment variable strings
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -24,474 +43,86 @@ def _env_bool(key: str, default: bool = False) -> bool:
 # Load .env (if present)
 load_dotenv()
 
-APP_TITLE = "Image Upload to S3 with Titan Multimodal Embeddings"
-DEFAULT_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
-# Prefer explicit env credentials over a profile
-ENV_AKI = os.getenv("AWS_ACCESS_KEY_ID")
-ENV_SAK = os.getenv("AWS_SECRET_ACCESS_KEY")
-ENV_STS = os.getenv("AWS_SESSION_TOKEN")
-DEFAULT_PROFILE = None if (ENV_AKI and ENV_SAK) else (os.getenv("AWS_PROFILE") or None)
-DEFAULT_MODEL_ID = "amazon.titan-embed-image-v1"
-DEFAULT_OUTPUT_EMBEDDING_LENGTH = 1024
-
-# App configuration from environment (no fallbacks - fail fast if missing)
-ENV_BUCKET = os.getenv("APP_S3_BUCKET")
-ENV_IMAGES_PREFIX = os.getenv("APP_IMAGES_PREFIX", "images/")
-ENV_EMBEDDINGS_PREFIX = os.getenv("APP_EMBEDDINGS_PREFIX", "embeddings/")
-ENV_VECTOR_BUCKET = os.getenv("S3V_VECTOR_BUCKET")
-ENV_INDEX_NAME = os.getenv("S3V_INDEX_NAME")
-ENV_INDEX_ARN = os.getenv("S3V_INDEX_ARN")
-ENV_MODEL_ID = os.getenv("MODEL_ID", DEFAULT_MODEL_ID)
-ENV_OUTPUT_DIM = int(os.getenv("OUTPUT_EMBEDDING_LENGTH", str(DEFAULT_OUTPUT_EMBEDDING_LENGTH)))
-
-# Use Claude 3.5 Sonnet v2 inference profile ID (required, not optional)
-ENV_CLAUDE_VISION_MODEL_ID = os.getenv("CLAUDE_VISION_MODEL_ID", "us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+APP_TITLE = "Multi-Modal Food Image Search with AWS AI Stack"
 
 
-# Helper for Bedrock inference profile/converse model ID normalization
-def _is_inference_profile_identifier(s: str) -> bool:
-    """Return True if the string looks like a Bedrock inference profile ID or ARN."""
-    if not isinstance(s, str):
-        return False
-    return s.startswith("us.") or (s.startswith("arn:aws:bedrock:") and ":inference-profile/" in s)
+# Bedrock helpers moved to mmfood.bedrock.ai
 
 
-def _resolve_converse_model_id(raw_id: Optional[str]) -> str:
-    """Normalize model identifier for Converse.
-
-    For some models (e.g., Anthropic Claude 3.5 Sonnet v2), Bedrock requires an
-    **inference profile** identifier (ID or ARN) rather than the foundation model ID
-    when using on-demand throughput. This function ensures we pass a valid inference
-    profile identifier to `bedrock-runtime.converse`.
-    """
-    model = (raw_id or ENV_CLAUDE_VISION_MODEL_ID or "").strip()
-    if not model:
-        raise ValueError(
-            "CLAUDE_VISION_MODEL_ID is not set. Set it to an inference profile ID (e.g., 'us.anthropic.claude-3-5-sonnet-20241022-v2:0') or its ARN."
-        )
-    if _is_inference_profile_identifier(model):
-        return model
-
-    # Known mappings: foundation model ID -> inference profile ID
-    known_map = {
-        "anthropic.claude-3-5-sonnet-20241022-v2:0": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "anthropic.claude-3-haiku-20240307-v1:0": "us.anthropic.claude-3-haiku-20240307-v1:0",
-        "anthropic.claude-3-7-sonnet-20250219-v1:0": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-    }
-    if model in known_map:
-        return known_map[model]
-
-    # If it's some other foundation model ID, force a clear configuration error.
-    raise ValueError(
-        (
-            "Bedrock Converse requires an inference profile ID/ARN for this model. "
-            f"Got foundation model ID '{model}'. Set CLAUDE_VISION_MODEL_ID to an inference profile (e.g., "
-            "'us.anthropic.claude-3-5-sonnet-20241022-v2:0') or the corresponding profile ARN from the Bedrock console."
-        )
-    )
+# AWS client helpers now imported from mmfood.aws.session
 
 
-def _get_boto3_session(region: Optional[str] = None, profile: Optional[str] = None):
-    """Create a boto3 Session prioritizing environment credentials over profiles.
-
-    Behavior:
-    - If AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set in the environment, use them and ignore profile.
-    - Otherwise, if a profile is provided, attempt to use it; if missing, fall back to default chain.
-    - Finally, fall back to the default credential chain (env vars, shared config, role).
-    """
-    # Resolve at call-time to reflect latest environment state
-    region = region or (os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or DEFAULT_REGION)
-
-    aki = os.getenv("AWS_ACCESS_KEY_ID")
-    sak = os.getenv("AWS_SECRET_ACCESS_KEY")
-    sts = os.getenv("AWS_SESSION_TOKEN")
-
-    # If explicit env credentials are present, prefer them and ignore any profile
-    if aki and sak:
-        return boto3.Session(
-            aws_access_key_id=aki,
-            aws_secret_access_key=sak,
-            aws_session_token=sts,
-            region_name=region,
-        )
-
-    # If no explicit creds, consider profile (explicit arg wins over env)
-    prof = profile if profile is not None else (os.getenv("AWS_PROFILE") or None)
-    if prof:
-        try:
-            return boto3.Session(profile_name=prof, region_name=region)
-        except ProfileNotFound:
-            print(f"[WARN] AWS profile '{prof}' not found. Falling back to default credentials.")
-
-    # Default chain (env vars, shared config/default, role)
-    return boto3.Session(region_name=region)
-
-
-def get_bedrock_client(region: Optional[str] = None, profile: Optional[str] = None):
-    session = _get_boto3_session(region, profile)
-    return session.client("bedrock-runtime")
-
-
-def get_s3_client(region: Optional[str] = None, profile: Optional[str] = None):
-    session = _get_boto3_session(region, profile)
-    return session.client("s3")
-
-
-def get_s3vectors_client(region: Optional[str] = None, profile: Optional[str] = None):
-    """Return a boto3 client for Amazon S3 Vectors."""
-    session = _get_boto3_session(region, profile)
-    return session.client("s3vectors")
-
-
-def generate_image_embedding(image_bytes: bytes, model_id: str, output_dim: int, bedrock_client) -> list:
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    body = json.dumps(
-        {
-            "inputImage": b64_image,
-            "embeddingConfig": {"outputEmbeddingLength": output_dim},
-        }
-    )
-
-    response = bedrock_client.invoke_model(
-        body=body, modelId=model_id, accept="application/json", contentType="application/json"
-    )
-    response_body = json.loads(response.get("body").read())
-    warning = response_body.get("message")
-    embedding = response_body.get("embedding")
-    if isinstance(embedding, list):
-        if warning:
-            print(f"[Titan warning:image] {warning}")
-        return embedding
-    if warning:
-        raise RuntimeError(f"Model error: {warning}")
-    raise RuntimeError("Embedding not found in model response.")
+# generate_image_embedding moved to mmfood.bedrock.ai (not used directly)
 
 
 
-def generate_mm_embedding(
-    *,
-    bedrock_client,
-    model_id: str,
-    output_dim: int,
-    input_text: Optional[str] = None,
-    input_image_bytes: Optional[bytes] = None,
-) -> list:
-    """Generate an embedding using Titan Multimodal for text and/or image.
 
-    - Caps input text to stay within Titan's ~128-token budget.
-    - Treats Titan body `message` as a warning if an embedding is present.
-    - Retries once with a tighter cap if Titan refuses due to token limits.
-    """
-    if not input_text and not input_image_bytes:
-        raise ValueError("Either input_text or input_image_bytes must be provided")
-
-    # Keep text within Titan's limit (conservative caps)
-    safe_text = None
-    if input_text:
-        safe_text = _titan_mm_safe_text(input_text, max_words=80)
-
-    def _invoke(text_for_body: Optional[str]):
-        body_dict = {"embeddingConfig": {"outputEmbeddingLength": output_dim}}
-        if text_for_body:
-            body_dict["inputText"] = text_for_body
-        if input_image_bytes:
-            body_dict["inputImage"] = base64.b64encode(input_image_bytes).decode("utf-8")
-        resp = bedrock_client.invoke_model(
-            body=json.dumps(body_dict),
-            modelId=model_id,
-            accept="application/json",
-            contentType="application/json",
-        )
-        body = json.loads(resp.get("body").read())
-        return body
-
-    body = _invoke(safe_text)
-    warning = (body or {}).get("message")
-    embedding = (body or {}).get("embedding")
-    if isinstance(embedding, list):
-        if warning:
-            print(f"[Titan warning:mm] {warning}")
-        return embedding
-
-    # Retry once if token/limit related and we had text
-    if warning and ("token" in warning.lower() or "limit" in warning.lower()) and safe_text:
-        tighter = _titan_mm_safe_text(safe_text, max_words=60)
-        body = _invoke(tighter)
-        embedding = (body or {}).get("embedding")
-        if isinstance(embedding, list):
-            return embedding
-        warning = (body or {}).get("message") or warning
-
-    if warning:
-        raise RuntimeError(f"Model error: {warning}")
-    raise RuntimeError("Embedding not found in model response.")
+# generate_mm_embedding now imported from mmfood.bedrock.ai
 
 
 
-def _titan_mm_safe_text(text: str, max_words: int = 80) -> str:
-    """Clean and truncate text for Titan MM input."""
-    if not text:
-        return ""
-    words = text.replace("\n", " ").split()
-    if len(words) > max_words:
-        return " ".join(words[:max_words])
-    return " ".join(words)
+# _titan_mm_safe_text moved to mmfood.bedrock.ai
 
 
-def _safe_json_loads(s: str) -> Optional[dict]:
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
+# _safe_json_loads moved to mmfood.bedrock.ai
 
 
-def _build_embed_text_from_struct(d: dict) -> str:
-    # Build a compact, search-friendly string for Titan MM (<= ~60-80 words)
-    items = ", ".join((d.get("items") or [])[:8])
-    prep = ", ".join((d.get("preparation") or [])[:5])
-    tags = ", ".join((d.get("dietary_tags") or [])[:10])
-    health = (d.get("perceived_healthiness") or "").strip()
-    parts = []
-    if items:
-        parts.append(f"items: {items}")
-    if prep:
-        parts.append(f"prep: {prep}")
-    if health:
-        parts.append(f"health: {health}")
-    if tags:
-        parts.append(f"tags: {tags}")
-    compact = "; ".join(parts)
-    return _titan_mm_safe_text(compact, max_words=60) or compact
+# _build_embed_text_from_struct moved to mmfood.bedrock.ai
 
 
-def generate_image_description(
-    image_bytes: bytes,
-    meal_data: dict,
-    bedrock_client,
-    claude_model_id: str = None,
-) -> Tuple[str, str]:
-    """
-    Generate a detailed description of the food image using Claude Vision.
-    Combines the meal metadata to create rich, searchable descriptions.
-    Returns a tuple: (display_text, embed_text)
-    """
-    claude_model_id = _resolve_converse_model_id(claude_model_id)
-    try:
-        prompt_text = (
-            "You are a nutrition-conscious vision assistant. Analyze the food image. "
-            "Return ONLY compact JSON with these keys: "
-            "items (array), preparation (array), sauces_or_sides (array), "
-            "perceived_healthiness (one of: 'healthy','moderate','indulgent'), "
-            "health_reasons (string, <=25 words), dietary_tags (array; choose from: "
-            "['high_protein','whole_grain','fresh_fruit','vegetables','nuts_seeds','dairy',"
-            "'fried','refined_carbs','processed_meat','added_syrup','high_sugar','high_salt']), "
-            "portion ('small'|'medium'|'large'). No prose, no markdown."
-            f"\n\nContext: meal_type={meal_data.get('meal_type','meal')}"
-        )
+## generate_image_description moved to mmfood.bedrock.ai
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"text": prompt_text},
-                    {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
-                ],
-            }
-        ]
-
-        response = bedrock_client.converse(
-            modelId=claude_model_id,
-            messages=messages,
-            inferenceConfig={"maxTokens": 160, "temperature": 0.1},
-        )
-
-        raw = response["output"]["message"]["content"][0]["text"].strip()
-        data = _safe_json_loads(raw)
-        if isinstance(data, dict):
-            items = ", ".join((data.get("items") or [])[:6])
-            health = data.get("perceived_healthiness") or "unknown"
-            reason = (data.get("health_reasons") or "").strip()
-            display = f"Items: {items}. Health: {health}. {reason}".strip()
-            embed_text = _build_embed_text_from_struct(data)
-            return display, embed_text
-        return raw, _titan_mm_safe_text(raw, max_words=80)
-    except Exception:
-        # Surface the error to the caller so Streamlit shows it instead of silently falling back.
-        raise
-
-
-def to_unix_ts(dt: datetime) -> int:
-    """Convert datetime to Unix timestamp (seconds). Defaults to UTC if naive."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
-
-
-
-def presign_url(s3_client, bucket: str, key: str, expires_in: int = 3600) -> str:
-    return s3_client.generate_presigned_url(
-        ClientMethod="get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires_in
-    )
-
-
-# Helper to fetch S3 object bytes directly (for image rendering)
-
-def get_object_bytes(s3_client, bucket: str, key: str) -> bytes:
-    resp = s3_client.get_object(Bucket=bucket, Key=key)
-    return resp["Body"].read()
-
-
-# Helper to fetch S3 object bytes and minimal metadata for debug display
-
-def get_object_bytes_and_meta(s3_client, bucket: str, key: str):
-    """Fetch object bytes and minimal metadata for debug display."""
-    meta = s3_client.head_object(Bucket=bucket, Key=key)
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
-    data = obj["Body"].read()
-    return data, {
-        "content_type": meta.get("ContentType"),
-        "content_length": meta.get("ContentLength"),
-        "etag": meta.get("ETag"),
-        "last_modified": str(meta.get("LastModified")),
-    }
+# to_unix_ts moved to mmfood.utils.time
 
 
 # Helper: Delete vector and its embedding JSON (if present)
-def delete_orphan_vector_and_artifacts(s3_client, s3v_client, *, index_arn: str = None, vector_bucket: str = None, index_name: str = None, key: str, meta: dict):
-    """Best-effort delete of an orphan vector and its embedding JSON.
-    Requires s3vectors:DeleteVectors and s3:DeleteObject.
+# S3 Vectors helpers moved to mmfood.s3vectors.utils
+ 
+
+
+def _validate_required_env_vars(cfg: AppConfig):
+    """Validate that all required environment variables are set.
+
+    Requires either `S3V_INDEX_ARN` OR both `S3V_VECTOR_BUCKET` and `S3V_INDEX_NAME`.
     """
-    # Delete vector from S3 Vectors
-    del_kwargs = {"keys": [key]}
-    if index_arn:
-        del_kwargs["indexArn"] = index_arn
-    else:
-        del_kwargs["vectorBucketName"] = vector_bucket
-        del_kwargs["indexName"] = index_name
-    try:
-        s3v_client.delete_vectors(**del_kwargs)
-    except Exception as e:
-        print(f"[cleanup] delete_vectors failed for {key}: {e}")
-    # Delete embedding JSON if we have it
-    emb_bucket = meta.get("s3_bucket")
-    emb_key = meta.get("s3_embedding_key")
-    if emb_bucket and emb_key:
-        try:
-            s3_client.delete_object(Bucket=emb_bucket, Key=emb_key)
-        except Exception as e:
-            print(f"[cleanup] delete_object failed for s3://{emb_bucket}/{emb_key}: {e}")
-
-
-def upload_bytes_to_s3(s3_client, bucket: str, key: str, data: bytes, content_type: Optional[str] = None):
-    extra = {"ContentType": content_type} if content_type else {}
-    s3_client.put_object(Bucket=bucket, Key=key, Body=data, **extra)
-
-
-def normalize_prefix(prefix: str) -> str:
-    prefix = prefix.strip()
-    if not prefix:
-        return ""
-    if not prefix.endswith("/"):
-        prefix += "/"
-    return prefix
-
-
-def ext_from_mime(mime: Optional[str]) -> str:
-    if not mime:
-        return ""
-    mapping = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-        "image/bmp": ".bmp",
-        "image/tiff": ".tiff",
-    }
-    return mapping.get(mime.lower(), "")
-
-
-
-def _md5_hex(b: bytes) -> str:
-    m = hashlib.md5()
-    m.update(b)
-    return m.hexdigest()
-
-# S3 Vectors allows at most 10 metadata keys per vector. Keep a stable priority.
-_S3V_META_PRIORITY = [
-    "user_id", "meal_type", "ts",
-    "s3_bucket", "s3_image_key", "s3_embedding_key",
-    "model_id", "uploaded_filename", "content_type", "meal_time",
-]
-
-def _s3v_merge_metadata(searchable: dict, non_searchable: dict, limit: int = 10) -> dict:
-    merged = {}
-    # apply priority order first
-    for k in _S3V_META_PRIORITY:
-        if k in searchable:
-            merged[k] = searchable[k]
-        if k in non_searchable and k not in merged:
-            merged[k] = non_searchable[k]
-        if len(merged) >= limit:
-            return merged
-    # fill remaining slots with any leftover keys (stable order)
-    for src in (searchable, non_searchable):
-        for k, v in src.items():
-            if k not in merged:
-                merged[k] = v
-                if len(merged) >= limit:
-                    return merged
-    return merged
-
-
-def _validate_required_env_vars():
-    """Validate that all required environment variables are set."""
-    missing_vars = []
-    
-    # Check required S3 configuration
-    if not ENV_BUCKET:
-        missing_vars.append("APP_S3_BUCKET")
-    
-    # Check required S3 Vectors configuration
-    if not ENV_VECTOR_BUCKET:
-        missing_vars.append("S3V_VECTOR_BUCKET")
-    if not ENV_INDEX_NAME:
-        missing_vars.append("S3V_INDEX_NAME")
-    if not ENV_INDEX_ARN:
-        missing_vars.append("S3V_INDEX_ARN")
-    
+    missing_vars = cfg.missing_required()
     if missing_vars:
+        details = (
+            "Provide either `S3V_INDEX_ARN` or both `S3V_VECTOR_BUCKET` and `S3V_INDEX_NAME`."
+        )
         st.error(
             "❌ **Missing Required Environment Variables**\n\n"
             "The following variables must be set in your `.env` file:\n\n" +
             "\n".join([f"• `{var}`" for var in missing_vars]) +
-            "\n\nPlease check your `.env` file and restart the application."
+            f"\n\n{details}\n\nPlease check your `.env` file and restart the application."
         )
         st.stop()
 
 
 def main():
-    st.set_page_config(page_title="S3 + Titan Embeddings", page_icon="🖼️", layout="centered")
+    st.set_page_config(page_title="Multi-Modal Food Search", page_icon="🍽️", layout="centered")
     st.title(APP_TITLE)
     st.caption(
-        "Upload an image, generate an embedding with Amazon Bedrock Titan Multimodal, and store both the image and embedding JSON in S3."
+        "🔍 **Search food images using text or images** • Powered by AWS S3 Vectors, Bedrock Titan Multi-Modal Embeddings, and Claude 3.5 Sonnet for AI-generated image descriptions"
     )
     
-    # Validate required environment variables first
-    _validate_required_env_vars()
+    # Load centralized configuration and validate
+    cfg = load_config()
+    _validate_required_env_vars(cfg)
 
-    # Load settings from environment (resolved at runtime to pick up .env changes)
-    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or DEFAULT_REGION
-    profile = None if (os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY")) else (os.getenv("AWS_PROFILE") or None)
-    bucket = ENV_BUCKET
-    images_prefix = normalize_prefix(ENV_IMAGES_PREFIX)
-    vectors_prefix = normalize_prefix(ENV_EMBEDDINGS_PREFIX)
-    model_id = ENV_MODEL_ID
-    output_dim = ENV_OUTPUT_DIM
+    # Settings
+    region = cfg.region
+    profile = cfg.profile
+    bucket = cfg.bucket
+    images_prefix = cfg.images_prefix
+    vectors_prefix = cfg.embeddings_prefix
+    model_id = cfg.model_id
+    output_dim = cfg.output_dim
 
-    # Load S3 Vectors configuration from environment
-    vector_bucket = ENV_VECTOR_BUCKET
-    index_name = ENV_INDEX_NAME
-    index_arn = ENV_INDEX_ARN
+    # S3 Vectors
+    vector_bucket = cfg.vector_bucket
+    index_name = cfg.index_name
+    index_arn = cfg.index_arn
 
     # Main content tabs: Ingest and Search
     ingest_tab, search_tab = st.tabs(["Ingest", "Search"])
@@ -521,7 +152,7 @@ def main():
                 st.info("Preview unavailable, proceeding with raw bytes.")
             
             # Reset generated data ONLY if a different image was uploaded
-            new_hash = _md5_hex(image_bytes)
+            new_hash = md5_hex(image_bytes)
             if st.session_state.last_image_hash and st.session_state.last_image_hash != new_hash:
                 st.session_state.generated_description = None
                 st.session_state.generated_embedding = None
@@ -584,6 +215,7 @@ def main():
                             image_bytes=st.session_state.current_image_bytes,
                             meal_data=meal_data,
                             bedrock_client=bedrock,
+                            claude_model_id=cfg.claude_vision_model_id,
                         )
                         st.session_state.generated_description = display_text
 
