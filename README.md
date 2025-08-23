@@ -1,6 +1,6 @@
-# Image Similarity Upload to S3 with Titan Multimodal Embeddings
+# Image Similarity Upload to S3 with Titan Multimodal Embeddings and Qdrant
 
-A simple Streamlit app to upload images, generate embeddings using Amazon Bedrock Titan Multimodal Embeddings, and store both the image and an embeddings JSON record in Amazon S3. It also inserts the embedding into an Amazon S3 Vectors index for similarity search.
+A simple Streamlit app to upload images, generate embeddings using Amazon Bedrock Titan Multimodal Embeddings, and store both the image and an embeddings JSON record in Amazon S3. It also inserts the embedding into a Qdrant vector database for similarity search.
 
 ## Prerequisites
 - Python environment managed with `uv` (already set up).

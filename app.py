@@ -20,16 +20,13 @@ from mmfood.utils.crypto import md5_hex
 from mmfood.aws.session import (
     get_bedrock_client,
     get_s3_client,
-    get_s3vectors_client,
 )
 from mmfood.bedrock.ai import (
     generate_mm_embedding,
     generate_image_description,
 )
-from mmfood.s3vectors.utils import (
-    merge_metadata as _s3v_merge_metadata,
-    delete_orphan_vector_and_artifacts,
-)
+from mmfood.qdrant.client import get_qdrant_client, ensure_collection_exists, validate_collection_config
+from mmfood.qdrant.operations import upsert_vector, search_vectors, delete_vector, get_vector_info
 from mmfood.config import load_config, AppConfig
 
 # Helper to read boolean from environment variable strings
@@ -81,20 +78,14 @@ APP_TITLE = "Multi-Modal Food Image Search with AWS AI Stack"
 
 
 def _validate_required_env_vars(cfg: AppConfig):
-    """Validate that all required environment variables are set.
-
-    Requires either `S3V_INDEX_ARN` OR both `S3V_VECTOR_BUCKET` and `S3V_INDEX_NAME`.
-    """
+    """Validate that all required environment variables are set."""
     missing_vars = cfg.missing_required()
     if missing_vars:
-        details = (
-            "Provide either `S3V_INDEX_ARN` or both `S3V_VECTOR_BUCKET` and `S3V_INDEX_NAME`."
-        )
         st.error(
             "❌ **Missing Required Environment Variables**\n\n"
             "The following variables must be set in your `.env` file:\n\n" +
             "\n".join([f"• `{var}`" for var in missing_vars]) +
-            f"\n\n{details}\n\nPlease check your `.env` file and restart the application."
+            "\n\nPlease check your `.env` file and restart the application."
         )
         st.stop()
 
@@ -103,7 +94,7 @@ def main():
     st.set_page_config(page_title="Multi-Modal Food Search", page_icon="🍽️", layout="centered")
     st.title(APP_TITLE)
     st.caption(
-        "🔍 **Search food images using text or images** • Powered by AWS S3 Vectors, Bedrock Titan Multi-Modal Embeddings, and Claude 3.5 Sonnet for AI-generated image descriptions"
+        "🔍 **Search food images using text or images** • Powered by Qdrant Vector Database, Bedrock Titan Multi-Modal Embeddings, and Claude 3.5 Sonnet for AI-generated image descriptions"
     )
     
     # Load centralized configuration and validate
@@ -119,10 +110,11 @@ def main():
     model_id = cfg.model_id
     output_dim = cfg.output_dim
 
-    # S3 Vectors
-    vector_bucket = cfg.vector_bucket
-    index_name = cfg.index_name
-    index_arn = cfg.index_arn
+    # Qdrant configuration
+    qdrant_url = cfg.qdrant_url
+    qdrant_api_key = cfg.qdrant_api_key
+    qdrant_collection = cfg.qdrant_collection_name
+    qdrant_timeout = cfg.qdrant_timeout
 
     # Main content tabs: Ingest and Search
     ingest_tab, search_tab = st.tabs(["Ingest", "Search"])
@@ -255,8 +247,8 @@ def main():
             if not bucket:
                 st.error("S3 bucket not configured. Please check your .env file.")
                 st.stop()
-            if not index_arn and (not vector_bucket or not index_name):
-                st.error("Please provide either Index ARN or both Vector Bucket Name and Index Name for S3 Vectors.")
+            if not qdrant_url:
+                st.error("Qdrant URL not configured. Please check your .env file.")
                 st.stop()
             # Extra safety: if Streamlit reran and lost state, avoid NoneType errors
             if st.session_state.generated_embedding is None:
@@ -266,26 +258,14 @@ def main():
                 st.error("Image bytes missing from session. Please re-upload the image and run Step 1 again.")
                 st.stop()
 
-            with st.spinner("Uploading to S3 and indexing..."):
+            with st.spinner("Uploading to S3 and indexing in Qdrant..."):
                 try:
                     s3 = get_s3_client(region, profile)
-                    s3v = get_s3vectors_client(region, profile)
+                    qdrant = get_qdrant_client(qdrant_url, qdrant_api_key, qdrant_timeout)
 
-                    # Validate index dimension matches embedding length
-                    try:
-                        if index_arn:
-                            idx_resp = s3v.get_index(indexArn=index_arn)
-                        else:
-                            idx_resp = s3v.get_index(vectorBucketName=vector_bucket, indexName=index_name)
-                        index_dim = int(idx_resp["index"].get("dimension"))
-                        if index_dim != len(st.session_state.generated_embedding):
-                            st.error(
-                                f"Index dimension ({index_dim}) does not match embedding length ({len(st.session_state.generated_embedding)}). "
-                                f"Please check your .env configuration."
-                            )
-                            st.stop()
-                    except Exception as ie:
-                        st.warning(f"Could not validate vector index dimension: {ie}")
+                    # Ensure collection exists and validate configuration
+                    ensure_collection_exists(qdrant, qdrant_collection, len(st.session_state.generated_embedding))
+                    validate_collection_config(qdrant, qdrant_collection, len(st.session_state.generated_embedding))
 
                     # Prepare S3 keys
                     image_id = str(uuid.uuid4())
@@ -330,14 +310,11 @@ def main():
                         content_type="application/json"
                     )
 
-                    # S3 Vectors: Store minimal metadata
-                    searchable_metadata = {
+                    # Qdrant: Prepare payload (all metadata, no 10-key limit!)
+                    qdrant_payload = {
                         "user_id": user_id,
                         "meal_type": meal_type,
                         "ts": ts,
-                    }
-
-                    non_searchable_metadata = {
                         "s3_image_key": image_key,
                         "s3_embedding_key": vector_key,
                         "s3_bucket": bucket,
@@ -345,34 +322,31 @@ def main():
                         "uploaded_filename": st.session_state.current_image_name,
                         "content_type": content_type,
                         "meal_time": meal_dt.isoformat(),
-                        "timestamp": datetime.now(timezone.utc).isoformat()
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "generated_description": st.session_state.generated_description,
+                        "embedding_length": len(st.session_state.generated_embedding),
+                        "output_embedding_length": output_dim,
+                        "region": region
                     }
 
-                    # Insert embedding into S3 Vectors
-                    compact_meta = _s3v_merge_metadata(searchable_metadata, non_searchable_metadata, limit=10)
-                    put_kwargs = {
-                        "vectors": [
-                            {
-                                "key": image_id,
-                                "data": {"float32": [float(x) for x in st.session_state.generated_embedding]},
-                                "metadata": compact_meta,
-                            }
-                        ]
-                    }
-                    if index_arn:
-                        put_kwargs["indexArn"] = index_arn
+                    # Insert embedding into Qdrant
+                    success = upsert_vector(
+                        qdrant,
+                        qdrant_collection,
+                        image_id,
+                        [float(x) for x in st.session_state.generated_embedding],
+                        qdrant_payload
+                    )
+
+                    if success:
+                        st.success("✅ Upload complete!")
+                        st.write("**Upload Details:**")
+                        st.write(f"• S3 Image Key: `{image_key}`")
+                        st.write(f"• S3 Embedding Key: `{vector_key}`")
+                        st.write(f"• Qdrant Collection: `{qdrant_collection}`")
+                        st.write(f"• Vector ID: `{image_id}`")
                     else:
-                        put_kwargs["vectorBucketName"] = vector_bucket
-                        put_kwargs["indexName"] = index_name
-
-                    s3v.put_vectors(**put_kwargs)
-
-                    st.success("✅ Upload complete!")
-                    st.write("**Upload Details:**")
-                    st.write(f"• S3 Image Key: `{image_key}`")
-                    st.write(f"• S3 Embedding Key: `{vector_key}`")
-                    st.write(f"• S3 Vectors Index: `{index_arn or f'{vector_bucket}/{index_name}'}`")
-                    st.write(f"• Vector ID: `{image_id}`")
+                        st.error("Failed to index vector in Qdrant")
 
                     # Clear session state after successful upload
                     st.session_state.generated_description = None
@@ -430,39 +404,33 @@ def main():
             if not user_id_f:
                 st.error("Please provide a User ID for user-specific search.")
                 st.stop()
-            if not index_arn and (not vector_bucket or not index_name):
-                st.error("Please provide either Index ARN or both Vector Bucket Name and Index Name for S3 Vectors.")
+            if not qdrant_url:
+                st.error("Qdrant URL not configured. Please check your .env file.")
                 st.stop()
             if (query_mode == "Text" and not query_text) and (query_mode == "Image" and not query_image_bytes):
                 st.error("Provide a search text or upload a query image.")
                 st.stop()
 
-            with st.spinner("Embedding query and querying S3 Vectors..."):
+            with st.spinner("Embedding query and searching in Qdrant..."):
                 try:
                     bedrock = get_bedrock_client(region, profile)
                     s3 = get_s3_client(region, profile)
-                    s3v = get_s3vectors_client(region, profile)
+                    qdrant = get_qdrant_client(qdrant_url, qdrant_api_key, qdrant_timeout)
 
-                    # Get index dimension to ensure matching embedding length
-                    if index_arn:
-                        idx_resp = s3v.get_index(indexArn=index_arn)
-                    else:
-                        idx_resp = s3v.get_index(vectorBucketName=vector_bucket, indexName=index_name)
-                    index_dim = int(idx_resp["index"].get("dimension"))
-                    index_metric = idx_resp["index"].get("distanceMetric")
+                    # Validate collection configuration
+                    collection_info = validate_collection_config(qdrant, qdrant_collection, output_dim)
 
                     # Create query embedding (text or image) using Titan Multimodal
                     q_embedding = generate_mm_embedding(
                         bedrock_client=bedrock,
                         model_id=model_id,
-                        output_dim=index_dim,
+                        output_dim=output_dim,
                         input_text=query_text if query_mode == "Text" else None,
                         input_image_bytes=query_image_bytes if query_mode == "Image" else None,
                     )
 
-                    # Build filter document
-                    conds = []
-                    conds.append({"user_id": {"$eq": user_id_f}})
+                    # Build filter conditions
+                    filters = {"user_id": {"$eq": user_id_f}}
 
                     # Date range handling
                     if isinstance(date_range, tuple) and len(date_range) == 2:
@@ -470,42 +438,34 @@ def main():
                         if isinstance(start_d, date) and isinstance(end_d, date):
                             start_dt = datetime.combine(start_d, dtime(0, 0, 0))
                             end_dt = datetime.combine(end_d, dtime(23, 59, 59))
-                            conds.append({"ts": {"$gte": to_unix_ts(start_dt), "$lte": to_unix_ts(end_dt)}})
+                            filters["ts"] = {
+                                "$gte": to_unix_ts(start_dt), 
+                                "$lte": to_unix_ts(end_dt)
+                            }
 
                     if meal_types:
-                        conds.append({"meal_type": {"$in": meal_types}})
+                        filters["meal_type"] = {"$in": meal_types}
 
-                    if len(conds) == 1:
-                        filter_doc = conds[0]
-                    else:
-                        filter_doc = {"$and": conds}
-
-                    q_kwargs = {
-                        "topK": int(top_k),
-                        "queryVector": {"float32": [float(x) for x in q_embedding]},
-                        "returnMetadata": True,
-                        "returnDistance": True,
-                        "filter": filter_doc,
-                    }
-                    if index_arn:
-                        q_kwargs["indexArn"] = index_arn
-                    else:
-                        q_kwargs["vectorBucketName"] = vector_bucket
-                        q_kwargs["indexName"] = index_name
-
-                    q_resp = s3v.query_vectors(**q_kwargs)
-                    results = q_resp.get("vectors", [])
+                    # Search vectors
+                    results = search_vectors(
+                        qdrant,
+                        qdrant_collection,
+                        [float(x) for x in q_embedding],
+                        limit=int(top_k),
+                        filters=filters,
+                        score_threshold=0.1  # Minimum similarity threshold
+                    )
 
                     if not results:
                         st.info("No results.")
                     else:
                         st.success(f"Found {len(results)} result(s)")
                         for item in results:
-                            key = item.get("key")
-                            meta = item.get("metadata", {}) or {}
-                            dist = item.get("distance")
-                            img_bucket = meta.get("s3_bucket")  # Updated to use optimized metadata
-                            img_key = meta.get("s3_image_key")
+                            vector_id = item.get("id")
+                            payload = item.get("payload", {})
+                            score = item.get("score")
+                            img_bucket = payload.get("s3_bucket")
+                            img_key = payload.get("s3_image_key")
                             cols = st.columns([1, 2])
                             with cols[0]:
                                 if img_bucket and img_key:
@@ -524,11 +484,11 @@ def main():
                                             img_obj = Image.open(io.BytesIO(data))
                                             if debug_mode:
                                                 st.write({"pil_format": img_obj.format, "size": img_obj.size})
-                                            st.image(img_obj, caption=f"{key}", use_container_width=True)
+                                            st.image(img_obj, caption=f"{vector_id}", use_container_width=True)
                                         except Exception as dec_err:
                                             if debug_mode:
                                                 st.warning(f"PIL decode failed: {dec_err}")
-                                            st.image(data, caption=f"{key}", use_container_width=True)
+                                            st.image(data, caption=f"{vector_id}", use_container_width=True)
                                     except Exception as fetch_err:
 
                                         if debug_mode:
@@ -544,17 +504,23 @@ def main():
                                             pass
                                         if missing:
                                             st.warning("Image object not found in S3. This looks like an **orphaned vector** (image deleted after indexing).")
-                                            if st.button("🧹 Delete this vector & JSON", key=f"del_{key}"):
+                                            if st.button("🧹 Delete this vector & JSON", key=f"del_{vector_id}"):
                                                 try:
-                                                    delete_orphan_vector_and_artifacts(
-                                                        s3, s3v,
-                                                        index_arn=index_arn,
-                                                        vector_bucket=vector_bucket,
-                                                        index_name=index_name,
-                                                        key=key,
-                                                        meta=meta,
-                                                    )
-                                                    st.success("Deleted vector and attempted to remove JSON artifact. Re-run the search.")
+                                                    # Delete from Qdrant
+                                                    delete_success = delete_vector(qdrant, qdrant_collection, vector_id)
+                                                    
+                                                    # Delete embedding JSON if present
+                                                    emb_key = payload.get("s3_embedding_key")
+                                                    if emb_key:
+                                                        try:
+                                                            s3.delete_object(Bucket=img_bucket, Key=emb_key)
+                                                        except Exception as e:
+                                                            print(f"[cleanup] delete_object failed for s3://{img_bucket}/{emb_key}: {e}")
+                                                    
+                                                    if delete_success:
+                                                        st.success("Deleted vector and attempted to remove JSON artifact. Re-run the search.")
+                                                    else:
+                                                        st.error("Failed to delete vector from Qdrant")
                                                 except Exception as del_err:
                                                     st.error(f"Cleanup failed: {del_err}")
                                         else:
@@ -563,7 +529,7 @@ def main():
                                                 url = presign_url(s3, img_bucket, img_key, expires_in=3600)
                                                 if debug_mode:
                                                     st.write({"presigned_url": url[:80] + "..."})
-                                                st.image(url, caption=f"{key}", use_container_width=True)
+                                                st.image(url, caption=f"{vector_id}", use_container_width=True)
                                             except Exception as url_err:
                                                 if debug_mode:
                                                     st.error(f"Presigned URL display failed: {url_err}")
@@ -571,16 +537,11 @@ def main():
                                 else:
                                     st.write("(no image metadata)")
                             with cols[1]:
-                                st.write(f"Key: {key}")
-                                sim_text = None
-                                if index_metric and index_metric.lower() == "cosine" and isinstance(dist, (int, float)):
-                                    sim = 1.0 - float(dist)
-                                    sim_text = f"Similarity: {sim:.4f}"
-                                if dist is not None:
-                                    st.write(f"Distance: {dist:.4f}")
-                                if sim_text:
-                                    st.write(sim_text)
-                                st.json(meta)
+                                st.write(f"Key: {vector_id}")
+                                # Qdrant uses cosine similarity (higher is better)
+                                if score is not None:
+                                    st.write(f"Similarity Score: {score:.4f}")
+                                st.json(payload)
                 except (ClientError, BotoCoreError) as aws_err:
                     st.error(f"AWS error: {aws_err}")
                 except Exception as e:
@@ -601,15 +562,19 @@ def main():
               - Titan Multimodal Embeddings model (`amazon.titan-embed-image-v1`)
               - Claude Vision via an **inference profile**. Set `CLAUDE_VISION_MODEL_ID` to the inference profile **ID** (e.g., `us.anthropic.claude-3-5-sonnet-20241022-v2:0`) or the **ARN**. The Converse API requires an inference profile for these Anthropic models.
               - To find the profile ID/ARN: Bedrock Console → Inference and assessment → **Cross-Region inference** → select the relevant profile (e.g., *US Anthropic Claude 3.5 Sonnet v2*) and copy its ID/ARN.
-            - The S3 bucket and S3 Vectors configuration are loaded from your `.env` file.
+            - Qdrant vector database configuration is loaded from your `.env` file:
+              - `QDRANT_URL`: URL of your Qdrant instance (e.g., `https://your-cluster.qdrant.tech:6333`)
+              - `QDRANT_API_KEY`: API key for authentication (if required)
+              - `QDRANT_COLLECTION_NAME`: Name of the collection to store vectors (default: `food_embeddings`)
             
             **Stored Objects:**
             - Images: `<images_prefix>/<uuid>.<ext>`
             - Embeddings JSON: `<embeddings_prefix>/<uuid>.json` (includes generated descriptions)
-            - S3 Vectors: Multi-modal embeddings indexed by image UUID
+            - Qdrant Vectors: Multi-modal embeddings indexed by image UUID with rich metadata (no 10-key limit)
             
             **Testing:**
-            - Run `./tests/run_tests.sh quick` to verify your AWS setup anytime.
+            - Note: The existing test scripts may need updates to work with Qdrant instead of S3 Vectors.
+            - Ensure your Qdrant instance is accessible and properly configured.
             """
         )
 

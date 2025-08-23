@@ -48,9 +48,3 @@ def get_bedrock_client(region: Optional[str] = None, profile: Optional[str] = No
 def get_s3_client(region: Optional[str] = None, profile: Optional[str] = None):
     session = _get_boto3_session(region, profile)
     return session.client("s3")
-
-
-def get_s3vectors_client(region: Optional[str] = None, profile: Optional[str] = None):
-    """Return a boto3 client for Amazon S3 Vectors."""
-    session = _get_boto3_session(region, profile)
-    return session.client("s3vectors")

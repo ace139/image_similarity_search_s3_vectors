@@ -20,9 +20,11 @@ class AppConfig:
     model_id: str
     output_dim: int
 
-    vector_bucket: Optional[str]
-    index_name: Optional[str]
-    index_arn: Optional[str]
+    # Qdrant configuration
+    qdrant_url: str
+    qdrant_api_key: Optional[str]
+    qdrant_collection_name: str
+    qdrant_timeout: int
 
     claude_vision_model_id: str
 
@@ -31,20 +33,19 @@ class AppConfig:
         if not self.bucket:
             missing.append("APP_S3_BUCKET")
 
-        # For S3 Vectors, require either index_arn OR (vector_bucket AND index_name)
-        if not self.index_arn:
-            if not self.vector_bucket:
-                missing.append("S3V_VECTOR_BUCKET")
-            if not self.index_name:
-                missing.append("S3V_INDEX_NAME")
+        # Qdrant requirements
+        if not self.qdrant_url:
+            missing.append("QDRANT_URL")
+        if not self.qdrant_collection_name:
+            missing.append("QDRANT_COLLECTION_NAME")
+        
         return missing
 
     def validate(self) -> None:
         missing = self.missing_required()
         if missing:
             raise ValueError(
-                "Missing required environment variables: " + ", ".join(missing) +
-                ". Provide either S3V_INDEX_ARN or both S3V_VECTOR_BUCKET and S3V_INDEX_NAME."
+                "Missing required environment variables: " + ", ".join(missing)
             )
 
 
@@ -66,10 +67,11 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
     model_id = env.get("MODEL_ID", "amazon.titan-embed-image-v1")
     output_dim = int(env.get("OUTPUT_EMBEDDING_LENGTH", "1024"))
 
-    # S3 Vectors
-    vector_bucket = env.get("S3V_VECTOR_BUCKET") or None
-    index_name = env.get("S3V_INDEX_NAME") or None
-    index_arn = env.get("S3V_INDEX_ARN") or None
+    # Qdrant configuration
+    qdrant_url = env.get("QDRANT_URL") or ""
+    qdrant_api_key = env.get("QDRANT_API_KEY") or None
+    qdrant_collection_name = env.get("QDRANT_COLLECTION_NAME", "food_embeddings")
+    qdrant_timeout = int(env.get("QDRANT_TIMEOUT", "60"))
 
     # Claude Vision inference profile (ID/ARN)
     claude_model = env.get("CLAUDE_VISION_MODEL_ID", DEFAULT_CLAUDE_VISION_PROFILE)
@@ -82,8 +84,9 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         embeddings_prefix=embeddings_prefix,
         model_id=model_id,
         output_dim=output_dim,
-        vector_bucket=vector_bucket,
-        index_name=index_name,
-        index_arn=index_arn,
+        qdrant_url=qdrant_url,
+        qdrant_api_key=qdrant_api_key,
+        qdrant_collection_name=qdrant_collection_name,
+        qdrant_timeout=qdrant_timeout,
         claude_vision_model_id=claude_model,
     )
