@@ -203,6 +203,10 @@ def main():
                     
                     # Generate detailed image description using Claude Vision
                     with st.spinner("Generating image description..."):
+                        if st.session_state.current_image_bytes is None:
+                            st.error("Image bytes are missing. Please upload an image first.")
+                            st.stop()
+                        
                         display_text, embed_text = generate_image_description(
                             image_bytes=st.session_state.current_image_bytes,
                             meal_data=meal_data,
@@ -213,6 +217,10 @@ def main():
 
                     # Generate multi-modal embedding (image + compact content tags)
                     with st.spinner("Generating multi-modal embedding..."):
+                        if st.session_state.current_image_bytes is None:
+                            st.error("Image bytes are missing. Please upload an image first.")
+                            st.stop()
+                        
                         embedding = generate_mm_embedding(
                             bedrock_client=bedrock,
                             model_id=model_id,
@@ -235,8 +243,9 @@ def main():
             st.info(st.session_state.generated_description)
             
             st.markdown("**Embedding Info:**")
-            st.write(f"• Dimension: {len(st.session_state.generated_embedding)}")
-            st.write(f"• First 10 values: {st.session_state.generated_embedding[:10]}")
+            if st.session_state.generated_embedding is not None:
+                st.write(f"• Dimension: {len(st.session_state.generated_embedding)}")
+                st.write(f"• First 10 values: {st.session_state.generated_embedding[:10]}")
         
         # Step 2: Upload to S3 and Index
         st.markdown("---")
@@ -430,7 +439,7 @@ def main():
                     )
 
                     # Build filter conditions
-                    filters = {"user_id": {"$eq": user_id_f}}
+                    filters: dict = {"user_id": {"$eq": user_id_f}}
 
                     # Date range handling
                     if isinstance(date_range, tuple) and len(date_range) == 2:
@@ -506,8 +515,12 @@ def main():
                                             st.warning("Image object not found in S3. This looks like an **orphaned vector** (image deleted after indexing).")
                                             if st.button("🧹 Delete this vector & JSON", key=f"del_{vector_id}"):
                                                 try:
+                                                    if vector_id is None:
+                                                        st.error("Vector ID is missing, cannot delete.")
+                                                        continue
+                                                    
                                                     # Delete from Qdrant
-                                                    delete_success = delete_vector(qdrant, qdrant_collection, vector_id)
+                                                    delete_success = delete_vector(qdrant, qdrant_collection, str(vector_id))
                                                     
                                                     # Delete embedding JSON if present
                                                     emb_key = payload.get("s3_embedding_key")

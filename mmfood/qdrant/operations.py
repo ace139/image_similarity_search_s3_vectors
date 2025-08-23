@@ -79,7 +79,7 @@ def search_vectors(
         return []
 
 
-def build_filter_conditions(filters: Dict[str, Union[str, Dict[str, Any]]]) -> Filter:
+def build_filter_conditions(filters: Dict[str, Union[str, Dict[str, Any]]]) -> Optional[Filter]:
     """Build Qdrant filter conditions from a dictionary.
     
     Supports:

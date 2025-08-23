@@ -35,10 +35,25 @@ def ensure_collection_exists(
     try:
         collection_info = client.get_collection(collection_name)
         # Validate vector size matches
-        if collection_info.config.params.vectors.size != vector_size:
+        vectors_config = collection_info.config.params.vectors
+        if vectors_config is None:
+            raise ValueError(f"Collection '{collection_name}' has no vector configuration")
+        
+        if isinstance(vectors_config, dict):
+            # Handle case where vectors is a dictionary (named vectors)
+            if not vectors_config:
+                raise ValueError(f"Collection '{collection_name}' has no vector configurations")
+            # Get the first (or default) vector configuration
+            vector_config = next(iter(vectors_config.values()))
+            actual_size = vector_config.size
+        else:
+            # Handle case where vectors is a single VectorParams object
+            actual_size = vectors_config.size
+        
+        if actual_size != vector_size:
             raise ValueError(
                 f"Collection '{collection_name}' has vector size "
-                f"{collection_info.config.params.vectors.size}, but expected {vector_size}"
+                f"{actual_size}, but expected {vector_size}"
             )
         return False  # Collection already exists
     except UnexpectedResponse as e:
@@ -71,7 +86,21 @@ def validate_collection_config(
             )
         raise
 
-    actual_size = collection_info.config.params.vectors.size
+    vectors_config = collection_info.config.params.vectors
+    if vectors_config is None:
+        raise ValueError(f"Collection '{collection_name}' has no vector configuration")
+    
+    if isinstance(vectors_config, dict):
+        # Handle case where vectors is a dictionary (named vectors)
+        if not vectors_config:
+            raise ValueError(f"Collection '{collection_name}' has no vector configurations")
+        # Get the first (or default) vector configuration
+        vector_config = next(iter(vectors_config.values()))
+        actual_size = vector_config.size
+    else:
+        # Handle case where vectors is a single VectorParams object
+        actual_size = vectors_config.size
+    
     if actual_size != expected_vector_size:
         raise ValueError(
             f"Collection '{collection_name}' has vector size {actual_size}, "
