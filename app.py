@@ -25,7 +25,7 @@ from mmfood.bedrock.ai import (
     generate_mm_embedding,
     generate_image_description,
 )
-from mmfood.qdrant.client import get_qdrant_client, ensure_collection_exists, validate_collection_config
+from mmfood.qdrant.client import get_qdrant_client, ensure_collection_exists, validate_collection_config, ensure_payload_indexes
 from mmfood.qdrant.operations import upsert_vector, search_vectors, delete_vector, get_vector_info
 from mmfood.config import load_config, AppConfig
 
@@ -275,6 +275,9 @@ def main():
                     # Ensure collection exists and validate configuration
                     ensure_collection_exists(qdrant, qdrant_collection, len(st.session_state.generated_embedding))
                     validate_collection_config(qdrant, qdrant_collection, len(st.session_state.generated_embedding))
+                    
+                    # Ensure payload indexes exist for filtering
+                    ensure_payload_indexes(qdrant, qdrant_collection, ["user_id", "meal_type", "ts"])
 
                     # Prepare S3 keys
                     image_id = str(uuid.uuid4())
@@ -428,6 +431,9 @@ def main():
 
                     # Validate collection configuration
                     collection_info = validate_collection_config(qdrant, qdrant_collection, output_dim)
+                    
+                    # Ensure payload indexes exist for filtering
+                    ensure_payload_indexes(qdrant, qdrant_collection, ["user_id", "meal_type", "ts"])
 
                     # Create query embedding (text or image) using Titan Multimodal
                     q_embedding = generate_mm_embedding(
